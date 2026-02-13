@@ -1,0 +1,32 @@
+{
+  "prediction_config": {
+    "max_length": 100,
+    "beam_width": 5,
+    "temperature": 0.75,
+    "length_penalty_alpha": 0.6,
+    "ngram_blocking_size": 2,
+    "frequency_penalty_weight": 3.0,
+    "attention_guided_weight": 2.0,
+    "diversity_penalty_weight": 0.3,
+    "min_length": 5,
+    "eos_threshold": 0.7,
+    "bias_words": [
+      "such", "also", "easily", "research", "should", "an", "the", "a",
+      "and", "or", "but", "in", "on", "at", "to", "for", "of", "with", "by",
+      "this", "that", "these", "those", "is", "are", "was", "were", "has",
+      "have", "had", "will", "would", "could", "should", "can", "may"
+    ]
+  },
+  "model_params": {
+    "input_dim": 2653,
+    "model_dim": 512,
+    "num_heads": 8,
+    "num_layers": 6
+  },
+  "training_config": {
+    "learning_rate": 0.0001,
+    "batch_size": 32,
+    "epochs": 100,
+    "warmup_steps": 4000
+  }
+}
