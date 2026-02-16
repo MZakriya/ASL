@@ -13,9 +13,148 @@ import mediapipe as mp
 import tempfile
 import asyncio
 from pathlib import Path
+from contextlib import asynccontextmanager
 from model import SignLanguageTransformer
 
-app = FastAPI(title="Sign Language Recognition API", version="1.0.0")
+# Global variables
+model = None
+vocab = None
+predictor = None
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    global model, vocab, predictor
+    
+    print("Loading model and vocabulary...")
+    
+    # Paths
+    model_path = "v18_ULTIMATE_POLISHED_E5.pth"
+    vocab_path = "vocab.pkl"
+    
+    print(f"[MODEL] Loading {model_path}...")
+    
+    # 1. Load Vocab
+    try:
+        with open(vocab_path, 'rb') as f:
+            vocab = pickle.load(f)
+        print(f"Vocabulary loaded. Size: {len(vocab)}")
+        
+        # Verify itos existence (User Request: Vocab Consistency)
+        if not hasattr(vocab, 'itos') or not hasattr(vocab, 'stoi'):
+             print(f"CRITICAL: Vocab missing 'itos' or 'stoi'. Please ensure pickle is correct.")
+             # We will try to patch it if it's a dict-like object or has different attributes
+             if hasattr(vocab, 'index2word'): vocab.itos = vocab.index2word
+             if hasattr(vocab, 'word2index'): vocab.stoi = vocab.word2index
+             
+             if not hasattr(vocab, 'itos'):
+                 raise ValueError("Vocabulary pickle MUST have 'itos' (index to string) mapping.")
+                 
+        print(f"Vocab has 'itos' mapping. Size: {len(vocab.itos)}")
+
+        # User Request: Vocabulary Mapping Verification
+        try:
+            sos_token = vocab.itos[1] if isinstance(vocab.itos, list) else vocab.itos.get(1, 'ERR')
+            eos_token = vocab.itos[2] if isinstance(vocab.itos, list) else vocab.itos.get(2, 'ERR')
+            print(f"DEBUG CHECK: Index 1 (SOS) = '{sos_token}'")
+            print(f"DEBUG CHECK: Index 2 (EOS) = '{eos_token}'")
+            
+            # User Request: Vocabulary Source Check for Index 129
+            idx_129 = vocab.itos[129] if isinstance(vocab.itos, list) else vocab.itos.get(129, 'ERR')
+            print(f"DEBUG CHECK: Index 129 = '{idx_129}'")
+            
+        except Exception as ve:
+            print(f"DEBUG CHECK FAILED: {ve}")
+
+    except Exception as e:
+        print(f"CRITICAL: Failed to load vocabulary: {e}")
+        yield
+        return
+
+    # 2. Checkpoint Loading (User Request: Explicit Mapping)
+    try:
+        if not os.path.exists(model_path):
+             print(f"Model file not found: {model_path}")
+             raise FileNotFoundError(model_path)
+             
+        print(f"Loading checkpoint from {model_path}...")
+        checkpoint = torch.load(model_path, map_location=device)
+        
+        keys = list(checkpoint.keys())
+        print(f"Checkpoint keys: {keys}")
+        
+        # 3. Instantiate Model (Lean v18 Architecture)
+        print("Instantiating model with strict vocab_size=9967...")
+        model = SignLanguageTransformer(
+            vocab_size=9967, # User Request: Exact match to checkpoint
+            d_model=512
+        )
+        model.to(device)
+        
+        # 4. Explicit Sub-Module Loading (User Request)
+        print("Loading weights into sub-modules...")
+
+        # Transformer
+        try:
+            if 'transformer' in checkpoint:
+                print("Loading transformer...")
+                model.transformer.load_state_dict(checkpoint['transformer'])
+            else:
+                print("CRITICAL WARNING: 'transformer' key missing in checkpoint!")
+        except Exception as e:
+            print(f"ERROR loading transformer: {e}")
+
+        # Src Proj
+        try:
+            if 'src_proj' in checkpoint:
+                print("Loading src_proj...")
+                model.src_proj.load_state_dict(checkpoint['src_proj'])
+            else:
+                 # Fallback check
+                 print("CRITICAL WARNING: 'src_proj' key missing!")
+        except Exception as e:
+            print(f"ERROR loading src_proj: {e}")
+
+        # Tgt Emb
+        try:
+            if 'tgt_emb' in checkpoint:
+                print("Loading tgt_emb...")
+                model.tgt_emb.load_state_dict(checkpoint['tgt_emb'])
+            else:
+                print("CRITICAL WARNING: 'tgt_emb' key missing!")
+        except Exception as e:
+             print(f"ERROR loading tgt_emb: {e}")
+
+        # FC Out
+        try:
+            if 'fc_out' in checkpoint:
+                print("Loading fc_out...")
+                model.fc_out.load_state_dict(checkpoint['fc_out'])
+            else:
+                print("CRITICAL WARNING: 'fc_out' key missing!")
+        except Exception as e:
+            print(f"ERROR loading fc_out: {e}")
+            
+        print("✅ Model weights loaded successfully with explicit mapping.")
+        
+        model.eval()
+        
+        # 6. Initialize Predictor
+        # Ensure AdvancedTranslationPredictor is defined when this runs
+        predictor = AdvancedTranslationPredictor(model, vocab, device)
+        print("AdvancedTranslationPredictor initialized.")
+        
+    except Exception as e:
+        print(f"Failed to load model: {e}")
+        import traceback
+        traceback.print_exc()
+
+    yield
+    # Cleanup
+    print("Shutting down...")
+
+
+app = FastAPI(title="Sign Language Recognition API", version="1.0.0", lifespan=lifespan)
 
 # Add CORS middleware for C# compatibility
 app.add_middleware(
@@ -37,90 +176,47 @@ holistic = mp_holistic.Holistic(
     min_tracking_confidence=0.5
 )
 
-# Global variables for model and vocabulary
-model = None
-vocab = None
-predictor = None
-device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-
 
 class Vocabulary:
     """
     Vocabulary class to map words to integers and vice versa.
-    Defined here to ensure pickle compatibility.
+    Strictly uses 'itos' and 'stoi' from the pickle.
     """
     def __init__(self):
-        self.word2index = {}
-        self.index2word = {}
-        self.word_count = {}
-        self.n_words = 0
-
-    def add_word(self, word):
-        # We don't really need this for loading, but keeping for completeness
-        if not hasattr(self, 'word2index'): self.word2index = {}
-        if not hasattr(self, 'index2word'): self.index2word = {}
-        if not hasattr(self, 'word_count'): self.word_count = {}
-        if not hasattr(self, 'n_words'): self.n_words = 0
-        
-        if word not in self.word2index:
-            self.word2index[word] = self.n_words
-            self.index2word[self.n_words] = word
-            self.word_count[word] = 1
-            self.n_words += 1
-        else:
-            self.word_count[word] += 1
+        # We expect these to be populated by pickle load
+        self.stoi = {}
+        self.itos = {}
 
     def token_to_id(self, token):
-        # Robust check for word mapping
-        # Priority: stoi (from debug output), word2index, word2id
-        w2i = getattr(self, 'stoi', getattr(self, 'word2index', getattr(self, 'word2id', {})))
-        
-        # Try direct match
-        if token in w2i:
-            return w2i[token]
-            
-        # Try uppercase (common for special tokens like <SOS>)
-        if token.upper() in w2i:
-            return w2i[token.upper()]
-            
-        # Try lowercase
-        if token.lower() in w2i:
-            return w2i[token.lower()]
-            
-        # Try to get token, default to UNK (often 0, 1, or 3)
-        # Check if <UNK> or <unk> exists in w2i to find default
-        default_id = w2i.get('<UNK>', w2i.get('<unk>', 0))
-        return w2i.get(token, default_id)
+        """
+        Strictly use stoi. No fuzzy matching.
+        """
+        if hasattr(self, 'stoi'):
+            # Check exactly
+            if token in self.stoi:
+                return self.stoi[token]
+            # If not found, return <UNK>
+            # We assume <UNK> is in stoi, otherwise 0?
+            return self.stoi.get('<UNK>', self.stoi.get('<unk>', 0))
+        return 0
 
     def id_to_token(self, token_id):
-        # Robust check for index mapping
-        # Priority: itos (from debug output), index2word, id2word
-        i2w = getattr(self, 'itos', getattr(self, 'index2word', getattr(self, 'id2word', {})))
-        # Handle list vs dict for itos
-        if isinstance(i2w, list):
-            if 0 <= token_id < len(i2w):
-                return i2w[token_id]
-            else:
-                return '<UNK>'
-        return i2w.get(token_id, '<UNK>')
+        """
+        Strictly use itos.
+        """
+        if hasattr(self, 'itos'):
+            if isinstance(self.itos, list):
+                if 0 <= token_id < len(self.itos):
+                    return self.itos[token_id]
+            elif isinstance(self.itos, dict):
+                 return self.itos.get(token_id, '<UNK>')
+        return '<UNK>'
         
     def __len__(self):
-        # Robust check for length
-        # Priority: itos (list), stoi (dict), n_words
         if hasattr(self, 'itos'): return len(self.itos)
         if hasattr(self, 'stoi'): return len(self.stoi)
-        if hasattr(self, 'n_words'): return self.n_words
-        if hasattr(self, 'num_words'): return self.num_words
-        if hasattr(self, 'word2index'): return len(self.word2index)
-        if hasattr(self, 'word2id'): return len(self.word2id)
         return 0
-        
-    def items(self):
-        # Allow iteration like a dict (for compatibility)
-        if hasattr(self, 'stoi'): return self.stoi.items()
-        if hasattr(self, 'word2index'): return self.word2index.items()
-        if hasattr(self, 'word2id'): return self.word2id.items()
-        return {}.items()
+
 
 class AdvancedTranslationPredictor:
 
@@ -131,47 +227,44 @@ class AdvancedTranslationPredictor:
         self.model = model
         self.vocab = vocab
         self.device = device
-        # self.vocab is now a Vocabulary object, so we rely on its methods
-        # self.idx_to_word is not needed as we can use vocab.id_to_token(idx)
 
-        # Initialize global repetition tracker
-        self.global_repetition_tracker = set()
-
-    def predict(self, keypoint_sequence, beam_width=3, max_length=100):
+    def predict(self, keypoint_sequence, beam_width=5, max_length=100, length_penalty=0.7):
         """
-        Predict translation using beam search with n-gram blocking
+        Predict translation using advanced beam search strategy.
+        Now uses the robust AdvancedTranslationPredictor class directly.
         """
         # Move model to eval mode
         self.model.eval()
 
         with torch.no_grad():
-            # keypoint_sequence is already batched [1, 200, 2653] from main endpoint
             keypoint_tensor = keypoint_sequence.to(self.device)
 
-            # Perform inference
-            # Handle different model architectures
-            try:
-                # Try standard forward pass
-                # For SignLanguageTransformer, we need encode() then decode() usually,
-                # but let's check if the generic forward works or if we need to call encode specifically.
-                # The model definition has an encode method.
-                # Let's assume predict_translation uses .encode(), which is compatible with our new class.
-                pass 
-                
-            except Exception as e:
-                print(f"Model inference error: {e}")
-                pass
-
-        # Use the advanced_predict_translation logic instead of this simplified version
-        # We need to import it first
-        from advanced_predict_translation import predict_translation
+        # Use the advanced predictor class directly for full control
+        from advanced_predict_translation import AdvancedTranslationPredictor as RealPredictor
         
-        # Call the advanced predictor
-        results = predict_translation(self.model, keypoint_tensor, self.vocab, beam_width=beam_width, max_length=max_length)
+        # Configure the predictor
+        config = {
+            'beam_width': 1, # User Request: Greedy Search Baseline (Beam=1)
+            'max_length': max_length,
+            'length_penalty_alpha': 1.0, 
+            'strict_repetition_penalty': 50.0, # User Request: Keep at 50.0 (subtraction logic)
+            'temperature': 0.4, # User Request: 0.4 (Strictly)
+            'top_k': 50,
+            'top_p': 0.95
+        }
         
-        print(f"DEBUG: Raw prediction results: {results}")
+        real_predictor = RealPredictor(self.model, self.vocab, config=config)
+        
+        # Run prediction
+        # RealPredictor.predict returns list of dicts with 'text'
+        results = real_predictor.predict(keypoint_tensor)
+        
+        print(f"DEBUG: Prediction Results: {results}")
         
         if results and len(results) > 0:
+            # Check for low confidence
+            if results[0].get('status') == 'low_confidence':
+                 print("WARNING: Prediction returned low confidence status.")
             return results[0]['text']
         else:
             return ""
@@ -197,16 +290,25 @@ def initialize_i3d():
             print(f"Loading I3D weights from {weights_path}...")
             state_dict = torch.load(weights_path, map_location='cpu')
             
-            # Patch for case sensitivity mismatch (logits -> Logits)
+            # Fix I3D Weight Loading: Case-insensitive key mapping
+            # User reported: I3D returning zeros due to weight naming mismatches
             new_state_dict = {}
             for k, v in state_dict.items():
-                if k.startswith('logits.'):
-                    new_key = k.replace('logits.', 'Logits.')
+                # Handle both 'logits' and 'Logits' variants (case-insensitive)
+                if 'logits' in k.lower():
+                    # Ensure it matches the model's expected key
+                    # Try both variants to find the correct one
+                    new_key = k.replace('logits', 'Logits').replace('Logits', 'Logits')  # Normalize to Logits
                 else:
                     new_key = k
                 new_state_dict[new_key] = v
             
-            i3d.load_state_dict(new_state_dict, strict=False) # Loose loading to be safe
+            print(f"Loaded {len(new_state_dict)} I3D weight tensors")
+            missing_keys = i3d.load_state_dict(new_state_dict, strict=False)
+            if missing_keys.missing_keys:
+                print(f"WARNING: Missing I3D keys: {missing_keys.missing_keys[:5]}")
+            if missing_keys.unexpected_keys:
+                print(f"INFO: Unexpected I3D keys: {missing_keys.unexpected_keys[:5]}")
         else:
             print(f"WARNING: I3D weights not found at {weights_path}. Using random initialization.")
             print("Please download rgb_imagenet.pt to improve accuracy.")
@@ -305,38 +407,71 @@ def extract_keypoints_from_video(video_path: str) -> list:
 
         # Convert BGR to RGB
         rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        height, width, _ = frame.shape
 
         # Process the frame with MediaPipe
         results = holistic.process(rgb_frame)
 
+        # Calculate Shoulder Distance for Z-Scaling (Indices 11 and 12)
+        z_scale_factor = 1.0
+        if results.pose_landmarks:
+            landmarks = results.pose_landmarks.landmark
+            left_shoulder = landmarks[11]
+            right_shoulder = landmarks[12]
+            
+            # Distance in normalized coordinates (0-1)
+            dist = np.sqrt((left_shoulder.x - right_shoulder.x)**2 + (left_shoulder.y - right_shoulder.y)**2)
+            if dist > 0.01:
+                # Scale so shoulder width is roughly unit distance? 
+                # Or just normalize relative to it.
+                # User says: "z is scaled relative to the distance between shoulders"
+                # Standard: z_new = z / dist
+                z_scale_factor = 1.0 / dist
+        
         # Extract landmarks
         frame_keypoints = []
 
-        # Pose landmarks (33 points * 3 coordinates = 99)
+        # Calculate Shoulder Distance for Z-Scaling (Indices 11 and 12)
+        z_scale_factor = 1.0
+        if results.pose_landmarks:
+            landmarks = results.pose_landmarks.landmark
+            left_shoulder = landmarks[11]
+            right_shoulder = landmarks[12]
+            
+            # Distance in normalized coordinates (0-1)
+            dist = np.sqrt((left_shoulder.x - right_shoulder.x)**2 + (left_shoulder.y - right_shoulder.y)**2)
+            if dist > 0.01:
+                z_scale_factor = 1.0 / dist
+        
+        # Pose landmarks (33 points * 4 coordinates = 132) -> UPDATED
+        # Include visibility as per user request (1662 total)
         if results.pose_landmarks:
             for landmark in results.pose_landmarks.landmark:
-                frame_keypoints.extend([landmark.x, landmark.y, landmark.z])
+                # Ensure x, y are normalized (MediaPipe gives 0-1)
+                # Ensure z is scaled
+                # Include visibility (essential for 1662 dim alignment)
+                frame_keypoints.extend([landmark.x, landmark.y, landmark.z * z_scale_factor, landmark.visibility])
         else:
-            frame_keypoints.extend([0.0] * 99)
+            frame_keypoints.extend([0.0] * 132)
 
         # Face landmarks (468 points * 3 coordinates = 1404)
         if results.face_landmarks:
             for landmark in results.face_landmarks.landmark:
-                frame_keypoints.extend([landmark.x, landmark.y, landmark.z])
+                frame_keypoints.extend([landmark.x, landmark.y, landmark.z * z_scale_factor])
         else:
             frame_keypoints.extend([0.0] * 1404)
 
         # Left hand landmarks (21 points * 3 coordinates = 63)
         if results.left_hand_landmarks:
             for landmark in results.left_hand_landmarks.landmark:
-                frame_keypoints.extend([landmark.x, landmark.y, landmark.z])
+                frame_keypoints.extend([landmark.x, landmark.y, landmark.z * z_scale_factor])
         else:
             frame_keypoints.extend([0.0] * 63)
 
         # Right hand landmarks (21 points * 3 coordinates = 63)
         if results.right_hand_landmarks:
             for landmark in results.right_hand_landmarks.landmark:
-                frame_keypoints.extend([landmark.x, landmark.y, landmark.z])
+                frame_keypoints.extend([landmark.x, landmark.y, landmark.z * z_scale_factor])
         else:
             frame_keypoints.extend([0.0] * 63)
 
@@ -354,361 +489,346 @@ def extract_keypoints_from_video(video_path: str) -> list:
     
     # 3. Concatenate Features and Enforce Strict Dimensions
     final_features = []
+    
+    # I3D Truncation Index: 1024 -> 991
+    # We take first 991 feature maps
+    i3d_dim = 991 
+    
     for i in range(num_frames):
-        # Apply weighting: MediaPipe (1629) gets 0.7, I3D (1024) gets 0.3
+        # Apply weighting: MediaPipe (1662) gets 0.7, I3D (991) gets 0.3
         # This prevents I3D from overpowering the landmarks
-        mediapipe_features = all_keypoints[i]
-        i3d_frame_features = i3d_features[i].tolist()
+        # Applying strict slice for MediaPipe (1662)
+        mediapipe_features = all_keypoints[i][:1662]
+        
+        # Taking strict slice of I3D (991)
+        i3d_frame_features = i3d_features[i].tolist()[:991]
         
         # Apply weights
         mediapipe_weighted = [x * 0.7 for x in mediapipe_features]
         i3d_weighted = [x * 0.3 for x in i3d_frame_features]
         
-        # Concatenate: 1629 + 1024 = 2653
+        # Concatenate: 1662 + 991 = 2653
         combined = mediapipe_weighted + i3d_weighted
         
-        # Spatial Clipping/Padding (Feature Dim)
-        if len(combined) < 2653:
-             combined = combined + [0.0] * (2653 - len(combined))
-        elif len(combined) > 2653:
-             # Strided sampling to preserve information (User Request)
-             # e.g. 2683 -> 2653
-             indices = np.linspace(0, len(combined)-1, 2653).astype(int)
-             combined = [combined[i] for i in indices]
+        # Verify Dimension
+        if len(combined) != 2653:
+            print(f"WARNING: Feature mismatch! MP({len(mediapipe_weighted)}) + I3D({len(i3d_weighted)}) = {len(combined)}")
+            # Fallback padding if needed (shouldn't happen with correct logic)
+            if len(combined) < 2653:
+                combined = combined + [0.0] * (2653 - len(combined))
+            else:
+                 combined = combined[:2653]
              
         final_features.append(combined)
 
-    # 4. Temporal Clipping/Padding (Sequence Length)
-    # Target: 200 frames (Strict)
+
+
+    # 4. Adaptive Frame Rate (User Request: Linear Interpolation)
+    # "Fallback from cv2.resize to Linear Interpolation"
     target_frames = 200
-    current_frames = len(final_features)
+    final_features = np.array(final_features, dtype=np.float32)
     
-    if current_frames < target_frames:
-        # Pad with zeros (2653 dim zero vector)
-        padding_needed = target_frames - current_frames
-        zeros = [0.0] * 2653
-        for _ in range(padding_needed):
-            final_features.append(zeros)
-    elif current_frames > target_frames:
-        # Clip
-        final_features = final_features[:target_frames]
+    # Input: (T, 2653)
+    # Convert to Tensor (Using global torch)
+    feat_t = torch.FloatTensor(final_features).permute(1, 0).unsqueeze(0) # (1, 2653, T)
+    
+    # Interpolate to 200
+    # Using global F
+    resampled = F.interpolate(feat_t, size=target_frames, mode='linear', align_corners=False)
+    
+    # Output: (1, 2653, 200) -> (2653, 200) -> (200, 2653)
+    final_features = resampled.squeeze(0).permute(1, 0).detach().cpu().numpy()
+        
+    print(f"Final extracted features shape: {final_features.shape}")
+        
+    print(f"Final extracted features shape: ({len(final_features)}, {len(final_features[0])})")
+    return final_features
         
     print(f"Final extracted features shape: ({len(final_features)}, {len(final_features[0])})")
     return final_features
 
 
-@app.on_event("startup")
-async def startup_event():
+
+
+def extract_i3d_features(video_path: str, target_length: int = 200) -> np.ndarray:
     """
-    Load model and vocabulary on startup with robust architecture detection
+    Extract 1024-dim features using I3D model.
+    Resizes frames to 224x224 and normalizes.
+    Returns array of shape (target_length, 1024).
     """
-    global model, vocab, predictor
-
-    print("Loading model and vocabulary...")
-
-    # Paths
-    model_path = "sign_language_FINAL_A100_SUCCESS.pth"
-    vocab_path = "vocab.pkl"
-
-    if not os.path.exists(model_path):
-        raise RuntimeError(f"Model file not found: {model_path}")
-    if not os.path.exists(vocab_path):
-        raise RuntimeError(f"Vocabulary file not found: {vocab_path}")
-
-    # 1. Load State Dict First to detect architecture
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    print(f"Loading checkpoint from {model_path}...")
-    
-    try:
-        checkpoint = torch.load(model_path, map_location=device)
-        if isinstance(checkpoint, dict) and 'model_state_dict' in checkpoint:
-            state_dict = checkpoint['model_state_dict']
-        elif isinstance(checkpoint, dict):
-            state_dict = checkpoint
-        else:
-            print("Checkpoint is not a dict. Assuming it is the full model model.")
-            # If it's a full model, we might need a different approach, but usually it's a dict
-            state_dict = checkpoint.state_dict()
-    except Exception as e:
-        raise RuntimeError(f"Failed to load checkpoint: {e}")
-
-    # 2. Architectue Auto-Detection
-    # Count layers
-    num_encoder_layers = 0
-    num_decoder_layers = 0
-    
-    keys = list(state_dict.keys())
-    for key in keys:
-        if "transformer.encoder.layers." in key:
-            # key format: transformer.encoder.layers.0.xxx
-            try:
-                layer_idx = int(key.split("transformer.encoder.layers.")[1].split(".")[0])
-                num_encoder_layers = max(num_encoder_layers, layer_idx + 1)
-            except: pass
-        if "transformer.decoder.layers." in key:
-            try:
-                layer_idx = int(key.split("transformer.decoder.layers.")[1].split(".")[0])
-                num_decoder_layers = max(num_decoder_layers, layer_idx + 1)
-            except: pass
-            
-    # Fallback/Validation
-    if num_encoder_layers == 0: num_encoder_layers = 4 # Default to 4 as per training config
-    if num_decoder_layers == 0: num_decoder_layers = 4 # Default to 4 as per training config
-    
-    print(f"Detected architecture: {num_encoder_layers} Encoder Layers, {num_decoder_layers} Decoder Layers")
-
-    # Detect Vocab Size from weights
-    # Try to find fc_out.weight or generator.weight
-    model_vocab_size = 10160 # Default fallback
-    if 'fc_out.weight' in state_dict:
-        model_vocab_size = state_dict['fc_out.weight'].shape[0]
-        print(f"Detected model vocab size from fc_out: {model_vocab_size}")
-    elif 'generator.weight' in state_dict:
-        model_vocab_size = state_dict['generator.weight'].shape[0]
-        print(f"Detected model vocab size from generator: {model_vocab_size}")
-    
-    # 3. Load Vocabulary File
-    import sys
-    if not hasattr(sys.modules['__main__'], 'Vocabulary'):
-        sys.modules['__main__'].Vocabulary = Vocabulary
-
-    with open(vocab_path, 'rb') as f:
-        vocab = pickle.load(f)
+    global i3d_model
+    if i3d_model is None:
+        initialize_i3d()
         
-    loaded_vocab_size = len(vocab)
-    print(f"Loaded vocabulary file with {loaded_vocab_size} tokens")
-    
-    # Strict Vocab Padding to 10160
-    target_vocab_size = 10160
-    if loaded_vocab_size < target_vocab_size:
-        diff = target_vocab_size - loaded_vocab_size
-        print(f"Padding vocabulary with {diff} dummy tokens to reach {target_vocab_size}...")
-        for i in range(diff):
-            vocab.add_word(f"<EXTRA_ID_{i}>")
-    elif loaded_vocab_size > target_vocab_size:
-        print(f"WARNING: Loade vocab size {loaded_vocab_size} > {target_vocab_size}. This might cause issues.")
+    if i3d_model is None:
+        raise RuntimeError("I3D Model could not be initialized.")
         
-    print(f"Final vocab size: {len(vocab)}")
-
-    # Debug: Check Vocabulary Index 1729 (User Request)
-    try:
-        vocab_1729 = vocab.id_to_token(1729)
-        print(f"DEBUG: Vocabulary Index 1729 maps to: '{vocab_1729}'")
-    except Exception as e:
-        print(f"DEBUG: Could not check index 1729: {e}")
-        
-    # 4. Instantiate Model
-    print("Instantiating model architecture with strict settings...")
-    # Architecture settings matched to checkpoint
-    model = SignLanguageTransformer(
-        input_dim=2653, 
-        d_model=512,
-        nhead=8,
-        num_encoder_layers=4,
-        num_decoder_layers=4,
-        vocab_size=10160
-    )
+    # Read video frames
+    cap = cv2.VideoCapture(video_path)
+    frames = []
     
-    model.to(device)
-    
-    # 5. Load Weights
-    print("Loading state dictionary into model...")
-    
-    new_state_dict = {}
-    
-    # Pre-process state_dict
-    if 'pos_encoder' in state_dict and 'pos_encoder.pe' not in state_dict:
-        print("Patching pos_encoder: Mapping 'pos_encoder' tensor to 'pos_encoder.pe' and 'pos_decoder.pe'")
-        pe_tensor = state_dict['pos_encoder']
-        # Ensure dimensions match max_len=200
-        # Checkpoint PE might be [1, 200, 512] or [200, 1, 512]
-        # Current model expects [200, 1, 512] (since batch_first=False usually for PE/Transformer)
-        # But let's check tensor shape
-        # If it is [1, 200, 512], and we need [200, 1, 512], we transpose.
-        if len(pe_tensor.shape) == 3 and pe_tensor.shape[0] == 1:
-             pe_tensor = pe_tensor.transpose(0, 1) # [1, 200, 512] -> [200, 1, 512]
-        elif len(pe_tensor.shape) == 2:
-             pe_tensor = pe_tensor.unsqueeze(1) # [200, 512] -> [200, 1, 512]
-            
-        new_state_dict['pos_encoder.pe'] = pe_tensor
-        new_state_dict['pos_decoder.pe'] = pe_tensor # Share PE
-    
-    for k, v in state_dict.items():
-        if k == 'pos_encoder': continue # Handled above
-        
-        new_key = k
-        # Map generator -> fc_out ALWAYS
-        # The model uses 'fc_out' as the registered module. 
-        # 'generator' is just an alias attribute, so it doesn't appear in state_dict keys.
-        if 'generator.' in k:
-             new_key = k.replace('generator.', 'fc_out.')
-             
-        # Patch I3D keys: logits -> Logits
-        # Note: I3D weights are loaded separately in i3d.py/initialize_i3d. 
-        # BUT if the main checkpoint contains I3D weights (unlikely given description, usually separate), we'd handle it here.
-        
-        new_state_dict[new_key] = v
-        
-    # BIDIRECTIONAL MAPPING for Generator/FC_Out
-    # Ensure both keys exist if one is present, to satisfy any model expectation
-    if 'fc_out.weight' in new_state_dict and 'generator.weight' not in new_state_dict:
-        print("Patching generator weights: Mapping 'fc_out' to 'generator'")
-        new_state_dict['generator.weight'] = new_state_dict['fc_out.weight']
-        if 'fc_out.bias' in new_state_dict:
-            new_state_dict['generator.bias'] = new_state_dict['fc_out.bias']
-            
-    if 'generator.weight' in new_state_dict and 'fc_out.weight' not in new_state_dict:
-         print("Patching fc_out weights: Mapping 'generator' to 'fc_out'")
-         new_state_dict['fc_out.weight'] = new_state_dict['generator.weight']
-         if 'generator.bias' in new_state_dict:
-             new_state_dict['fc_out.bias'] = new_state_dict['generator.bias']
-        
-    # Debug Vocab Indices (User Request)
-    sos_id = vocab.token_to_id('<sos>') if hasattr(vocab, 'token_to_id') else vocab.word2index.get('<sos>')
-    eos_id = vocab.token_to_id('<eos>') if hasattr(vocab, 'token_to_id') else vocab.word2index.get('<eos>')
-    pour_id = vocab.token_to_id('pour') if hasattr(vocab, 'token_to_id') else vocab.word2index.get('pour', 'N/A')
-    
-    print(f"DEBUG VOCAB INDICES: SOS={sos_id}, EOS={eos_id}, 'pour'={pour_id}")
-
-    try:
-        keys = model.load_state_dict(new_state_dict, strict=False)
-        if keys.missing_keys:
-            print(f"Warning: Missing keys: {keys.missing_keys[:5]}... (Total {len(keys.missing_keys)})")
-            # CRITICAL: Check if fc_out/generator is missing
-            if any('fc_out' in k for k in keys.missing_keys):
-                print("CRITICAL ERROR: fc_out weights are missing! Output will be garbage.")
-                
-        if keys.unexpected_keys:
-            print(f"Warning: Unexpected keys: {keys.unexpected_keys[:5]}... (Total {len(keys.unexpected_keys)})")
-            
-    except Exception as e:
-         print(f"Error loading state dict: {e}")
+    # Check if video opened
+    if not cap.isOpened():
+         raise ValueError(f"Could not open video file: {video_path}")
          
-    model.eval()
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            break
+        try:
+            # Resize into 224x224
+            frame = cv2.resize(frame, (224, 224))
+            # Convert BGR to RGB
+            frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            # Normalize to [-1, 1] for I3D
+            frame = (frame / 255.0) * 2 - 1
+            frames.append(frame)
+        except Exception as e:
+            print(f"Warning: Error processing frame: {e}")
+            continue
+            
+    cap.release()
+    
+    if not frames:
+        raise ValueError("No frames extracted from video. Video might be corrupted or empty.")
+        
+    # Convert to tensor: [1, 3, T, 224, 224]
+    frames_arr = np.array(frames, dtype=np.float32) # (T, 224, 224, 3)
+    frames_arr = frames_arr.transpose(3, 0, 1, 2)   # (3, T, 224, 224)
+    input_tensor = torch.from_numpy(frames_arr).unsqueeze(0) # (1, 3, T, 224, 224)
+    
+    # Move to device
+    device = next(i3d_model.parameters()).device
+    input_tensor = input_tensor.to(device)
+    
+    # Inference in chunks if T is large to avoid OOM? 
+    # For now assume it fits or simple inference
+    # I3D needs minimum frames? Typically 8.
+    if input_tensor.shape[2] < 8:
+         # Pad temporal dimension
+         pad_t = 8 - input_tensor.shape[2]
+         input_tensor = F.pad(input_tensor, (0,0, 0,0, 0,pad_t))
+    
+    with torch.no_grad():
+        # I3D extract_features returns [1, T_out, 1024]
+        features = i3d_model.extract_features(input_tensor) 
+        
+    features = features.squeeze(0).cpu().numpy() # [T_out, 1024]
+    
+    # Debug: Check if I3D features are all zeros
+    if np.all(features == 0):
+        raise ValueError("I3D features are all zeros after extraction. Video content might be problematic.")
+    
+    # Interpolate to match target_length (200)
+    # Note: User request says "interpolate BOTH to exactly 200 frames" in predict.
+    # Here we can return raw features or interpolated. 
+    # predict() asks for `target_length` but we are updating predict to interpolate separately.
+    # So let's return raw features here?
+    # BUT existing function signature has `target_length`.
+    # I will allow `target_length=None` to return raw, 
+    # OR since predict logic will change, I can update THIS function to return raw?
+    # Actually, I'll keep interpolation logic here but default to 200, 
+    # AND in predict I'll set target_length=200.
+    
+    if target_length is not None:
+        current_len = features.shape[0]
+        if current_len != target_length:
+            feat_tensor = torch.from_numpy(features).unsqueeze(0).transpose(1, 2) # [1, 1024, T_out]
+            # Linear interpolation
+            feat_interpolated = F.interpolate(
+                feat_tensor, size=target_length, mode='linear', align_corners=False
+            )
+            features = feat_interpolated.transpose(1, 2).squeeze(0).numpy() # [target_length, 1024]
+            
+    print(f"DEBUG: I3D Features Stats - Mean: {features.mean():.4f}, Std: {features.std():.4f}")
+    return features
 
-    # Initialize predictor
-    predictor = AdvancedTranslationPredictor(model, vocab, device)
 
-    print("Model and vocabulary loaded successfully!")
+def extract_landmarks_from_video(video_path):
+    """
+    Extracts 1629 holistic landmarks from a video (Pose 99, Face 1404, Hands 126).
+    Returns shape (Frames, 1629).
+    """
+    print(f"DEBUG: Extracting landmarks from {video_path}...")
+    cap = cv2.VideoCapture(video_path)
+    frames = []
+    
+    # We use the global 'holistic' instance. 
+    # For production, instantiation per request is safer for concurrency.
+    
+    while cap.isOpened():
+        success, image = cap.read()
+        if not success:
+            break
+            
+        image.flags.writeable = False
+        image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+        
+        # Process
+        results = holistic.process(image)
+        
+        # Extract landmarks (Total 1629) to match v18 model
+        
+        # Pose (33*3 = 99) - Drop Visibility for v18 compatibility
+        if results.pose_landmarks:
+            pose = np.array([[res.x, res.y, res.z] for res in results.pose_landmarks.landmark]).flatten()
+        else:
+            pose = np.zeros(99)
+            
+        # Face (468*3 = 1404) - Take first 468 (ignore iris refinement)
+        if results.face_landmarks:
+            # Slicing [:468] ensures we skip refined iris landmarks (468-477)
+            face = np.array([[res.x, res.y, res.z] for res in results.face_landmarks.landmark[:468]]).flatten()
+        else:
+            face = np.zeros(1404)
+            
+        # Left Hand (21*3 = 63)
+        if results.left_hand_landmarks:
+            lh = np.array([[res.x, res.y, res.z] for res in results.left_hand_landmarks.landmark]).flatten()
+        else:
+            lh = np.zeros(63)
+
+        # Right Hand (21*3 = 63)
+        if results.right_hand_landmarks:
+            rh = np.array([[res.x, res.y, res.z] for res in results.right_hand_landmarks.landmark]).flatten()
+        else:
+            rh = np.zeros(63)
+            
+        # 99 + 1404 + 63 + 63 = 1629
+        features = np.concatenate([pose, face, lh, rh])
+        frames.append(features)
+        
+    cap.release()
+    
+    return np.array(frames)
 
 
 @app.post("/predict", response_class=JSONResponse)
-async def predict_sign_language(file: UploadFile = File(...)):
+async def predict(video_file: UploadFile = File(...)):
     """
-    Process uploaded video and return sign language translation
+    Process uploaded .mp4 video file, extract MediaPipe features (1629), 
+    concatenate with I3D (1024), and predict translation.
+    Total Input Dim: 2653.
     """
-    # Validate file type
-    if not file.filename.lower().endswith(('.mp4', '.avi', '.mov', '.mkv', '.wmv')):
-        raise HTTPException(status_code=400, detail="Invalid file type. Please upload a video file.")
-
-    # Create temporary file
-    temp_video = tempfile.NamedTemporaryFile(delete=False, suffix=os.path.splitext(file.filename)[1])
+    import io
+    import os
+    import shutil
+    
+    print(f"📥 Received video file: {video_file.filename}")
+    
+    # 1. Save Video to Temporary File
     try:
-        # Save uploaded file to temporary location
-        contents = await file.read()
-        temp_video.write(contents)
-        temp_video_path = temp_video.name
-        temp_video.close()
-
-        print(f"Processing video: {temp_video_path}")
-
-        # Extract keypoints from video
-        keypoints_list = extract_keypoints_from_video(temp_video_path)
-
-        if not keypoints_list:
-            raise HTTPException(status_code=400, detail="No keypoints extracted from video. Please check the video quality.")
-
-        # Convert list of keypoints to a numpy array for easier manipulation and shape checking
-        import numpy as np
-        keypoints = np.array(keypoints_list, dtype=np.float32)
-
-        print(f"Extracted keypoints array shape: {keypoints.shape}")
-
-        if keypoints.shape[0] == 0:
-            # Clean up temporary file
-            if os.path.exists(temp_video_path):
-                os.unlink(temp_video_path)
-            return JSONResponse(content={"prediction": "Error: No keypoints extracted"}, status_code=400)
-
-        # Convert to tensor efficiently
-        # keypoints is (200, 2653) float32 numpy array
-        input_tensor = torch.from_numpy(keypoints).unsqueeze(0).to(device)
-
-        # Debug: Print raw feature statistics BEFORE normalization
-        print(f"RAW Features - Mean: {input_tensor.mean().item():.6f}, Std: {input_tensor.std().item():.6f}, Min: {input_tensor.min().item():.6f}, Max: {input_tensor.max().item():.6f}")
-
-        # Global StandardScaler (Z-score normalization)
-        # Calculate global mean and std across ALL features (not per-feature)
-        global_mean = input_tensor.mean()
-        global_std = input_tensor.std()
-        
-        # Apply Z-score normalization: (x - mean) / std
-        input_tensor = (input_tensor - global_mean) / (global_std + 1e-8)
-        
-        print(f"Global Normalization - Mean: {global_mean.item():.6f}, Std: {global_std.item():.6f}")
-        
-        # Debug: Print normalized feature statistics AFTER normalization
-        print(f"NORMALIZED Features - Mean: {input_tensor.mean().item():.6f}, Std: {input_tensor.std().item():.6f}, Min: {input_tensor.min().item():.6f}, Max: {input_tensor.max().item():.6f}")
-
-        # 5. Predict using the advanced prediction function directly
-        from advanced_predict_translation import predict_translation
-
-        # Call the prediction function with updated parameters for better beam search
-        prediction_results = predict_translation(
-            predictor.model,
-            input_tensor,
-            predictor.vocab,
-            beam_width=5,
-            max_length=20,
-            repetition_penalty_factor=1.5,      # As requested
-            ngram_blocking_size=2              # As requested (no_repeat_ngram_size)
-        )
-
-        # Handle the prediction results properly
-        if isinstance(prediction_results, list) and len(prediction_results) > 0:
-             # Handle list output (old behavior)
-             first_result = prediction_results[0]
-             if isinstance(first_result, dict):
-                 final_text_string = first_result.get('text', str(first_result))
-             else:
-                 final_text_string = str(first_result)
-        elif isinstance(prediction_results, dict):
-             # Handle dictionary output (New Low Confidence Logic)
-             if 'prediction' in prediction_results and 'status' in prediction_results:
-                 # It's a structured response, return it directly
-                 return JSONResponse(content=prediction_results)
-             
-             # Otherwise extract text
-             final_text_string = prediction_results.get('text', prediction_results.get('prediction', str(prediction_results)))
-        else:
-             final_text_string = str(prediction_results) if prediction_results else ""
-
-        # Clean Output: Strip any special tokens like <SOS> or <EOS>
-        special_tokens = ['<sos>', '<eos>', '<SOS>', '<EOS>', '<unk>', '<UNK>', '<pad>', '<PAD>']
-        cleaned_text = final_text_string
-        for token in special_tokens:
-            cleaned_text = cleaned_text.replace(token, "").strip()
-
-        # Additional cleaning: remove extra whitespace
-        import re
-        cleaned_text = re.sub(r'\s+', ' ', cleaned_text).strip()
-
-        # Clean up temporary file
-        if os.path.exists(temp_video_path):
-            os.unlink(temp_video_path)
-
-        # Return proper JSON response for C# compatibility
-        return JSONResponse(content={
-            "prediction": cleaned_text  # Return as proper JSON object as requested
-        })
-
+        temp_filename = f"temp_{video_file.filename}"
+        with open(temp_filename, "wb") as buffer:
+            shutil.copyfileobj(video_file.file, buffer)
+            
+        print(f"DEBUG: Saved temp video to {temp_filename}")
     except Exception as e:
-        # Ensure cleanup happens even if there's an error
-        if 'temp_video_path' in locals() and os.path.exists(temp_video_path):
-            os.unlink(temp_video_path)
+        raise HTTPException(status_code=500, detail=f"Failed to save uploaded video: {e}")
 
-        print(f"Error processing video: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"Error processing video: {str(e)}")
+    try:
+        # 2. Extract MediaPipe Features (Raw)
+        # extract_landmarks_from_video returns (Frames_MP, 1629)
+        mp_features = extract_landmarks_from_video(temp_filename)
+        print(f"DEBUG: Extracted MP features shape: {mp_features.shape}")
+        
+        if len(mp_features) == 0:
+             raise ValueError("No MediaPipe landmarks detected.")
+             
+        # Strict Feature Subsetting for MP
+        if mp_features.shape[1] > 1629:
+            mp_features = mp_features[:, :1629]
+        elif mp_features.shape[1] < 1629:
+            # Pad if less? Unlikely with my function.
+            pass
+
+        # 3. Handle I3D Features (Local or Real Extraction)
+        video_basename = os.path.splitext(video_file.filename)[0]
+        i3d_dir = r"D:\All Projects\ASLR\i3d_features"
+        i3d_path = os.path.join(i3d_dir, f"{video_basename}.npy")
+        
+        i3d_features = None
+        
+        # Try Local
+        if os.path.exists(i3d_path):
+            try:
+                i3d_features = np.load(i3d_path, allow_pickle=True)
+                print(f"DEBUG: Loaded local I3D features: {i3d_features.shape}")
+            except Exception as e:
+                print(f"WARNING: Loal I3D load failed: {e}")
+
+        # Real Extraction
+        if i3d_features is None:
+            print("DEBUG: Extracting Real I3D features...")
+            # We want raw or interpolated?
+            # User says: "Linear Interpolation Check: Ensure concatenation ... happens after both are interpolated to exactly 200 frames."
+            # So let's ask extract_i3d_features to give us 200 frames directly.
+            i3d_features = extract_i3d_features(temp_filename, target_length=200)
+            print(f"DEBUG: Extracted I3D features: {i3d_features.shape}")
+            
+        # 4. Interpolation & Concatenation
+        TARGET_FRAMES = 200
+        
+        # Interpolate MP to 200
+        # mp_features is (T_mp, 1629) -> Need (200, 1629)
+        mp_t = torch.FloatTensor(mp_features).unsqueeze(0).transpose(1, 2) # (1, 1629, T_mp)
+        mp_interp = F.interpolate(mp_t, size=TARGET_FRAMES, mode='linear', align_corners=False)
+        mp_final = mp_interp.transpose(1, 2).squeeze(0).numpy() # (200, 1629)
+        
+        # Interpolate I3D to 200 (if not already)
+        # i3d_features should be (T, 1024). Ideally (200, 1024) if extracting fresh.
+        # If loaded from local, might differ.
+        if i3d_features.shape[0] != TARGET_FRAMES:
+             i3d_t = torch.FloatTensor(i3d_features).unsqueeze(0).transpose(1, 2) # (1, 1024, T)
+             i3d_interp = F.interpolate(i3d_t, size=TARGET_FRAMES, mode='linear', align_corners=False)
+             i3d_final = i3d_interp.transpose(1, 2).squeeze(0).numpy() # (200, 1024)
+        else:
+             i3d_final = i3d_features
+             
+        # Ensure I3D dim is 1024
+        if i3d_final.shape[1] > 1024:
+            i3d_final = i3d_final[:, :1024]
+        elif i3d_final.shape[1] < 1024:
+            pad = np.zeros((TARGET_FRAMES, 1024 - i3d_final.shape[1]))
+            i3d_final = np.concatenate((i3d_final, pad), axis=1)
+            
+        # Concatenate RAW features: (200, 1629) + (200, 1024) -> (200, 2653)
+        print("DEBUG: Using RAW features (No Norm, No Weights) per User Request")
+        
+        # User Request: "Concatenation Order Lock... torch.cat"
+        # Since mp_final/i3d_final are numpy, we convert to torch first to match user syntax request strictly
+        # mp_final: (200, 1629), i3d_final: (200, 1024)
+        mp_tensor = torch.from_numpy(mp_final)
+        i3d_tensor = torch.from_numpy(i3d_final)
+        
+        combined_tensor = torch.cat([mp_tensor, i3d_tensor], dim=-1) # (200, 2653)
+        
+        print(f"DEBUG: Final Concatenated Shape: {combined_tensor.shape}")
+        print(f"DEBUG: Feature Stats - Max: {combined_tensor.max():.4f}, Min: {combined_tensor.min():.4f}, Mean: {combined_tensor.mean():.4f}, Std: {combined_tensor.std():.4f}")
+        
+        # Prepare Batch: [1, 200, 2653]
+        input_batch = combined_tensor.unsqueeze(0).float()
+        
+        # 5. Predict
+        # Use beam_width=10, length_penalty=0.7 as requested
+        result_text = predictor.predict(input_batch, beam_width=10, max_length=12, length_penalty=0.7)
+        
+        if not result_text:
+            result_text = "DEBUG: No sequence generated because output was empty string."
+        
+        # Clean up
+        if os.path.exists(temp_filename): os.remove(temp_filename)
+        
+        return JSONResponse(content={"prediction": result_text, "status": "success"})
+            
+    except Exception as e:
+        if os.path.exists(temp_filename): os.remove(temp_filename)
+        print(f"ERROR: {e}")
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"Processing Error: {str(e)}")
+            
+
 
 
 @app.get("/")

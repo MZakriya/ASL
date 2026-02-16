@@ -9,7 +9,7 @@ def predict_translation(model,
                       vocab,
                       max_length=100,
                       beam_width=5,
-                      temperature=0.75,
+                      temperature=0.7,
                       length_penalty_alpha=0.6,
                       ngram_blocking_size=2,
                       frequency_penalty_weight=2.0,
@@ -259,7 +259,7 @@ def predict_translation_advanced(model,
                                vocab,
                                max_length=100,
                                beam_width=5,
-                               temperature=0.75,
+                               temperature=0.7,
                                **kwargs):
     """
     Advanced version with more modular components

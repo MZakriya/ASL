@@ -3,7 +3,7 @@
     "max_length": 100,
     "beam_width": 5,
     "temperature": 0.75,
-    "length_penalty_alpha": 0.6,
+    "length_penalty_alpha": 0.4,
     "ngram_blocking_size": 2,
     "frequency_penalty_weight": 3.0,
     "attention_guided_weight": 2.0,
