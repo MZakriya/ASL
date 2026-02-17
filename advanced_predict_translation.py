@@ -5,9 +5,16 @@ from collections import defaultdict, deque
 import math
 import logging
 
+import logging
+import os
+
 # Setup logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+def log_debug(msg):
+    with open("debug_logits.log", "a") as f:
+        f.write(msg + "\n")
 
 class AdvancedTranslationPredictor:
     """
@@ -46,10 +53,16 @@ class AdvancedTranslationPredictor:
                 pass
 
 
-    def predict(self, encoder_input):
+    def predict(self, encoder_input, **kwargs):
         """
         Main prediction entry point.
+        Allows overriding config keys via kwargs.
         """
+        # Update config with runtime overrides
+        initial_config = self.config.copy()
+        for k, v in kwargs.items():
+            self.config[k] = v
+        
         self.model.eval()
         with torch.no_grad():
             # Encode
@@ -106,18 +119,21 @@ class AdvancedTranslationPredictor:
             # Apply Temp & Penalty (Strict)
             logits = logits / (temp + 1e-9)
             
-            # Repetition Penalty
-            for t in sequence:
-                if t not in [self.sos_id, self.eos_id, self.pad_id]:
-                     logits[0, t] -= penalty
+            # Repetition Penalty (Relaxed)
+            penalty = self.config.get('strict_repetition_penalty', 5.0)
+            if penalty > 0:
+                for t in sequence:
+                    if t not in [self.sos_id, self.eos_id, self.pad_id]:
+                         logits[0, t] -= penalty
                      
             prob = torch.nn.functional.softmax(logits, dim=-1)
             next_word = torch.argmax(prob, dim=-1).item()
             
-            # Debug Top 1 choice
-            if i == 0:
-                 print(f"DEBUG: Greedy Step 0 Top1 Index: {next_word} Prob: {prob[0, next_word]:.4f}")
-                 
+            # Debug Top 1 choice and Stats
+            msg = f"Step {i}: Val={next_word} Prob={prob[0, next_word]:.4f} LogitMax={logits.max():.4f}"
+            print(msg)
+            log_debug(msg)
+            
             sequence.append(next_word)
             
             # Append to input (User Request: "ys = torch.cat...")
@@ -215,13 +231,13 @@ class AdvancedTranslationPredictor:
                              
                      print(f"DEBUG: Step {len(seq)} Top 5: {top_words} Probs: {topv[0].tolist()}")
 
-                # Apply Repetition Penalty to Used Tokens (USER REQUEST: ENFORCE STRICT PENALTY)
-                penalty = self.config.get('strict_repetition_penalty', 100.0)
+                # Apply Repetition Penalty to Used Tokens (Relaxed)
+                penalty = self.config.get('strict_repetition_penalty', 5.0)
                 if penalty > 0:
-                    for t in used_tokens:
-                        # Don't penalize EOS/PAD if they are in used_tokens (shouldn't be except EOS at end)
-                        # We specifically want to stop "this this this", so we penalize 'this'.
-                        if t != self.eos_id and t != self.pad_id and t != self.sos_id:
+                    # CUMULATIVE PENALTY via sequence iteration
+                    for t in seq:
+                        # Don't penalize EOS/PAD/SOS
+                        if t not in [self.sos_id, self.eos_id, self.pad_id]:
                             if t < logits.shape[1]:
                                  logits[0, t] -= penalty
                                  

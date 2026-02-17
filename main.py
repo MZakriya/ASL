@@ -247,7 +247,7 @@ class AdvancedTranslationPredictor:
             'beam_width': 1, # User Request: Greedy Search Baseline (Beam=1)
             'max_length': max_length,
             'length_penalty_alpha': 1.0, 
-            'strict_repetition_penalty': 50.0, # User Request: Keep at 50.0 (subtraction logic)
+            'strict_repetition_penalty': 50.0, # User Request: Maximized to break strong bias
             'temperature': 0.4, # User Request: 0.4 (Strictly)
             'top_k': 50,
             'top_p': 0.95
@@ -792,8 +792,17 @@ async def predict(video_file: UploadFile = File(...)):
             pad = np.zeros((TARGET_FRAMES, 1024 - i3d_final.shape[1]))
             i3d_final = np.concatenate((i3d_final, pad), axis=1)
             
-        # Concatenate RAW features: (200, 1629) + (200, 1024) -> (200, 2653)
-        print("DEBUG: Using RAW features (No Norm, No Weights) per User Request")
+        # 4b. Feature Normalization (Disabled: Ablation showed Raw is better)
+        # Input: (200, 2653) - Raw MediaPipe (0-1) + Raw I3D
+        # We need to normalize this to (Mean=0, Std=1) for the Transformer
+        # eps = 1e-6
+        # mp_final = (mp_final - mp_final.mean(axis=0)) / (mp_final.std(axis=0) + eps)
+        # i3d_final = (i3d_final - i3d_final.mean(axis=0)) / (i3d_final.std(axis=0) + eps)
+        
+        print("DEBUG: Skipped Instance Normalization (Using RAW features per ablation results).")
+
+        # Concatenate Normalized features: (200, 1629) + (200, 1024) -> (200, 2653)
+        print("DEBUG: Using RAW features for Robust Prediction")
         
         # User Request: "Concatenation Order Lock... torch.cat"
         # Since mp_final/i3d_final are numpy, we convert to torch first to match user syntax request strictly
