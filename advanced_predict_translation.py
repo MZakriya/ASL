@@ -79,6 +79,10 @@ class AdvancedTranslationPredictor:
             results.append(best_seq)
             return results
 
+        # Normalize penalty to be positive for subtraction
+        if self.config['strict_repetition_penalty'] < 0:
+             self.config['strict_repetition_penalty'] = abs(self.config['strict_repetition_penalty'])
+        
         for i in range(batch_size):
             best_seq = self._beam_search(encoder_output[i:i+1])
             text = self._decode_sequence(best_seq['sequence'])
@@ -90,16 +94,20 @@ class AdvancedTranslationPredictor:
     def _greedy_search(self, encoder_output):
         """
         User Request: Simple Greedy Search Baseline.
-        next_token = torch.argmax(logits, dim=-1).item()
+        STRICT ARGMAX for Alignment Verification.
         """
         max_len = self.config['max_length']
-        penalty = self.config.get('strict_repetition_penalty', 50.0)
-        temp = self.config.get('temperature', 0.4)
+        # For alignment check, we might want to disable ALL penalties
+        # But let's respect config if passed, default to 0 for strict check
+        penalty = self.config.get('strict_repetition_penalty', 0.0) 
+        temp = self.config.get('temperature', 1.0) # Default 1.0 for raw logits
         
         # Start with SOS
         ys = torch.ones(1, 1).fill_(self.sos_id).type_as(encoder_output).long()
         
         sequence = [self.sos_id]
+        
+        print(f"DEBUG: Starting Greedy Search (Penalty={penalty}, Temp={temp})")
         
         for i in range(max_len - 1):
             # Check mask
@@ -116,11 +124,18 @@ class AdvancedTranslationPredictor:
             generator = getattr(self.model, 'fc_out', getattr(self.model, 'generator', None))
             logits = generator(last_hidden) # [1, vocab]
             
+            # RAW LOGIT CHECK
+            raw_val, raw_idx = torch.max(logits, dim=-1)
+            raw_token = "UNK"
+            if hasattr(self.vocab, 'id_to_token'): raw_token = self.vocab.id_to_token(raw_idx.item())
+            elif hasattr(self.vocab, 'itos'): raw_token = self.vocab.itos.get(raw_idx.item(), "UNK")
+            print(f"DEBUG: Step {i} RAW (No Pen): {raw_token} ({raw_idx.item()}) Val={raw_val.item():.4f}")
+
             # Apply Temp & Penalty (Strict)
-            logits = logits / (temp + 1e-9)
+            if temp != 1.0:
+                logits = logits / (temp + 1e-9)
             
             # Repetition Penalty (Relaxed)
-            penalty = self.config.get('strict_repetition_penalty', 5.0)
             if penalty > 0:
                 for t in sequence:
                     if t not in [self.sos_id, self.eos_id, self.pad_id]:
@@ -132,11 +147,11 @@ class AdvancedTranslationPredictor:
             # Debug Top 1 choice and Stats
             msg = f"Step {i}: Val={next_word} Prob={prob[0, next_word]:.4f} LogitMax={logits.max():.4f}"
             print(msg)
-            log_debug(msg)
+            # log_debug(msg) # Optional
             
             sequence.append(next_word)
             
-            # Append to input (User Request: "ys = torch.cat...")
+            # Append to input
             ys = torch.cat([ys, torch.ones(1, 1).type_as(ys.data).fill_(next_word)], dim=1)
             
             if next_word == self.eos_id:

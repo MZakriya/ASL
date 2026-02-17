@@ -15,6 +15,7 @@ import asyncio
 from pathlib import Path
 from contextlib import asynccontextmanager
 from model import SignLanguageTransformer
+from advanced_predict_translation import AdvancedTranslationPredictor
 
 # Global variables
 model = None
@@ -41,17 +42,19 @@ async def lifespan(app: FastAPI):
         print(f"Vocabulary loaded. Size: {len(vocab)}")
         
         # Verify itos existence (User Request: Vocab Consistency)
-        if not hasattr(vocab, 'itos') or not hasattr(vocab, 'stoi'):
-             print(f"CRITICAL: Vocab missing 'itos' or 'stoi'. Please ensure pickle is correct.")
-             # We will try to patch it if it's a dict-like object or has different attributes
-             if hasattr(vocab, 'index2word'): vocab.itos = vocab.index2word
-             if hasattr(vocab, 'word2index'): vocab.stoi = vocab.word2index
-             
-             if not hasattr(vocab, 'itos'):
-                 raise ValueError("Vocabulary pickle MUST have 'itos' (index to string) mapping.")
-                 
-        print(f"Vocab has 'itos' mapping. Size: {len(vocab.itos)}")
-
+        if hasattr(vocab, 'itos'):
+             print(f"Vocab has 'itos' mapping. Size: {len(vocab)}")
+        elif hasattr(vocab, 'index2word'):
+             vocab.itos = vocab.index2word
+             print(f"Vocab has 'index2word' mapping. Patched to 'itos'.")
+        
+        # DEBUG: Check specific tokens to rule out offset shifting
+        # User says 15='this', 129='for'
+        t15 = vocab.itos.get(15, "ERR") if hasattr(vocab, 'itos') else "ERR"
+        t129 = vocab.itos.get(129, "ERR") if hasattr(vocab, 'itos') else "ERR"
+        print(f"DEBUG CHECK: Index 15 = '{t15}' (Expected 'this')")
+        print(f"DEBUG CHECK: Index 129 = '{t129}' (Expected 'for')")
+        
         # User Request: Vocabulary Mapping Verification
         try:
             sos_token = vocab.itos[1] if isinstance(vocab.itos, list) else vocab.itos.get(1, 'ERR')
@@ -141,7 +144,12 @@ async def lifespan(app: FastAPI):
         
         # 6. Initialize Predictor
         # Ensure AdvancedTranslationPredictor is defined when this runs
-        predictor = AdvancedTranslationPredictor(model, vocab, device)
+        # Use a default config for the global instance, but predict() calls will override it
+        base_config = {
+             'beam_width': 5,
+             'strict_repetition_penalty': 50.0 # Default high penalty
+        }
+        predictor = AdvancedTranslationPredictor(model, vocab, config=base_config)
         print("AdvancedTranslationPredictor initialized.")
         
     except Exception as e:
@@ -218,60 +226,7 @@ class Vocabulary:
         return 0
 
 
-class AdvancedTranslationPredictor:
 
-    """
-    Advanced translation predictor with beam search and n-gram blocking
-    """
-    def __init__(self, model, vocab, device='cpu'):
-        self.model = model
-        self.vocab = vocab
-        self.device = device
-
-    def predict(self, keypoint_sequence, beam_width=5, max_length=100, length_penalty=0.7):
-        """
-        Predict translation using advanced beam search strategy.
-        Now uses the robust AdvancedTranslationPredictor class directly.
-        """
-        # Move model to eval mode
-        self.model.eval()
-
-        with torch.no_grad():
-            keypoint_tensor = keypoint_sequence.to(self.device)
-
-        # Use the advanced predictor class directly for full control
-        from advanced_predict_translation import AdvancedTranslationPredictor as RealPredictor
-        
-        # Configure the predictor
-        config = {
-            'beam_width': 1, # User Request: Greedy Search Baseline (Beam=1)
-            'max_length': max_length,
-            'length_penalty_alpha': 1.0, 
-            'strict_repetition_penalty': 50.0, # User Request: Maximized to break strong bias
-            'temperature': 0.4, # User Request: 0.4 (Strictly)
-            'top_k': 50,
-            'top_p': 0.95
-        }
-        
-        real_predictor = RealPredictor(self.model, self.vocab, config=config)
-        
-        # Run prediction
-        # RealPredictor.predict returns list of dicts with 'text'
-        results = real_predictor.predict(keypoint_tensor)
-        
-        print(f"DEBUG: Prediction Results: {results}")
-        
-        if results and len(results) > 0:
-            # Check for low confidence
-            if results[0].get('status') == 'low_confidence':
-                 print("WARNING: Prediction returned low confidence status.")
-            return results[0]['text']
-        else:
-            return ""
-
-    def _beam_search_with_ngram_blocking(self, outputs, beam_width, max_length):
-        # This method is replaced by advanced_predict_translation
-        pass
 
 
 # Initialize I3D Model
@@ -816,11 +771,23 @@ async def predict(video_file: UploadFile = File(...)):
         print(f"DEBUG: Feature Stats - Max: {combined_tensor.max():.4f}, Min: {combined_tensor.min():.4f}, Mean: {combined_tensor.mean():.4f}, Std: {combined_tensor.std():.4f}")
         
         # Prepare Batch: [1, 200, 2653]
-        input_batch = combined_tensor.unsqueeze(0).float()
+        input_batch = combined_tensor.unsqueeze(0).float().to(device)
         
         # 5. Predict
-        # Use beam_width=10, length_penalty=0.7 as requested
-        result_text = predictor.predict(input_batch, beam_width=10, max_length=12, length_penalty=0.7)
+        # STRICT ALIGNMENT CHECK: Beam=1, Penalty=0.0
+        print("DEBUG: Running STRICT GREEDY SEARCH for Alignment Check.")
+        results = predictor.predict(
+            input_batch, 
+            beam_width=1, 
+            max_length=12, 
+            length_penalty=0.0,
+            strict_repetition_penalty=0.0,
+            temperature=1.0 # Raw logits
+        )
+        if results and len(results) > 0:
+             result_text = results[0]['text']
+        else:
+             result_text = ""
         
         if not result_text:
             result_text = "DEBUG: No sequence generated because output was empty string."
