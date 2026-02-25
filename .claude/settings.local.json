@@ -3,7 +3,10 @@
     "allow": [
       "Bash(python test_prediction.py:*)",
       "Bash(chmod:*)",
-      "Bash(dir:*)"
+      "Bash(dir:*)",
+      "Bash(py:*)",
+      "Bash(python:*)",
+      "Bash(uvicorn main:app:*)"
     ]
   }
 }

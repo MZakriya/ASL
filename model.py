@@ -21,63 +21,73 @@ class PositionalEncoding(nn.Module):
         # Add PE up to seq_len
         # self.pe is [1, max_len, d_model]
         # Slice columns (dim 1)
-        return x + self.pe[:, :x.size(1), :]
+        return x + self.pe[:, :x.size(1), :].detach()
 
 class SignLanguageTransformer(nn.Module):
-    def __init__(self, input_dim=2653, d_model=512, nhead=8, num_encoder_layers=4, num_decoder_layers=4, dim_feedforward=2048, dropout=0.1, vocab_size=10160):
+    def __init__(self, input_dim=1536, d_model=512, nhead=8, num_encoder_layers=6, num_decoder_layers=6, dim_feedforward=2048, dropout=0.1, vocab_size=10160):
         super(SignLanguageTransformer, self).__init__()
-        
-        # Enforce strict architecture (Lean v18)
-        input_dim = 2653
-        
+
+        self.input_dim = input_dim  # Keep as instance variable for consistency
         self.d_model = d_model
-        
-        # Encoder projection (Renamed from input_proj to src_proj per v18 checkpoint)
+
+        # Encoder projection (mapping input to d_model)
         self.src_proj = nn.Linear(input_dim, d_model)
-        self.pos_encoder = PositionalEncoding(d_model, max_len=300) # Increased max_len to be safe
-        
+
+        # Initialize positional encoding manually
+        self.pos_encoder = PositionalEncoding(d_model, max_len=300)
+
         # Decoder embedding
         self.tgt_emb = nn.Embedding(vocab_size, d_model)
         self.pos_decoder = PositionalEncoding(d_model, max_len=300)
-        
-        # Transformer
-        self.transformer = nn.Transformer(
+
+        # Transformer - Using more standard parameters that might match the original Kaggle model
+        encoder_layer = nn.TransformerEncoderLayer(
             d_model=d_model,
             nhead=nhead,
-            num_encoder_layers=num_encoder_layers,
-            num_decoder_layers=num_decoder_layers,
             dim_feedforward=dim_feedforward,
             dropout=dropout,
-            batch_first=True # User Request: Fix UserWarning
+            batch_first=True
         )
-        
+        decoder_layer = nn.TransformerDecoderLayer(
+            d_model=d_model,
+            nhead=nhead,
+            dim_feedforward=dim_feedforward,
+            dropout=dropout,
+            batch_first=True
+        )
+
+        self.transformer_encoder = nn.TransformerEncoder(encoder_layer, num_layers=num_encoder_layers)
+        self.transformer_decoder = nn.TransformerDecoder(decoder_layer, num_layers=num_decoder_layers)
+
         # Generator
         self.fc_out = nn.Linear(d_model, vocab_size)
         
     def encode(self, search_source):
         # Input: [batch, seq_len, features]
         # print(f"DEBUG: encode input shape: {search_source.shape}")
-        
+
         # Project features (Using src_proj)
         src = self.src_proj(search_source) * math.sqrt(self.d_model)
         src = self.pos_encoder(src) # Apply PE (Restores Order)
-        
+
         # No permute needed because batch_first=True
         # src is [batch, seq_len, d_model]
-        
+
         # Encoder
-        memory = self.transformer.encoder(src)
-        
+        memory = self.transformer_encoder(src)
+
         # Validate memory
         # memory is [batch, seq_len, d_model]
         variance = torch.var(memory).item()
-        print(f"DEBUG: Encoder Variance: {variance:.4f}")
-        
+        # print(f"DEBUG: Encoder Variance: {variance:.4f}")
+
         if variance > 0.5:
-            print("[STATUS: ALIVE] Encoder Variance is healthy.")
+            # print("[STATUS: ALIVE] Encoder Variance is healthy.")
+            pass
         else:
-             print(f"WARNING: Low Encoder Variance! ({variance:.4f})")
-        
+             # print(f"WARNING: Low Encoder Variance! ({variance:.4f})")
+             pass
+
         return memory
 
     def generate_square_subsequent_mask(self, sz):
@@ -88,24 +98,33 @@ class SignLanguageTransformer(nn.Module):
     def decode(self, tgt, memory, tgt_mask=None):
         # tgt: [batch, seq_len]
         # memory: [batch, src_len, d_model]
-        
+
         tgt = self.tgt_emb(tgt) * math.sqrt(self.d_model)
         tgt = self.pos_decoder(tgt) # Apply PE (Restores Order)
         # No permute: [batch, seq_len, d_model]
-        
-        # nn.Transformer decoder takes tgt and memory
-        output = self.transformer.decoder(tgt, memory, tgt_mask=tgt_mask)
-        
+
+        # Transformer decoder takes tgt and memory
+        # Ensure tgt_mask is properly shaped if provided
+        if tgt_mask is not None and tgt_mask.size(0) != tgt.size(1):
+            # Regenerate mask if it doesn't match the target sequence length
+            tgt_mask = self.generate_square_subsequent_mask(tgt.size(1)).to(tgt.device)
+
+        output = self.transformer_decoder(tgt, memory, tgt_mask=tgt_mask)
+
         return output # [batch, seq_len, d_model]
 
     def forward(self, src, tgt):
         # Simplified forward
-        
-        # Project src
         src = self.src_proj(src) * math.sqrt(self.d_model)
-        
-        # Embed tgt
+        src = self.pos_encoder(src)
+
         tgt = self.tgt_emb(tgt) * math.sqrt(self.d_model)
-        
-        output = self.transformer(src, tgt)
+        tgt = self.pos_decoder(tgt)
+
+        # Encoder
+        memory = self.transformer_encoder(src)
+
+        # Decoder
+        output = self.transformer_decoder(tgt, memory)
+
         return self.fc_out(output)
