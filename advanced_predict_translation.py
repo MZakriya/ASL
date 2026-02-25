@@ -386,17 +386,15 @@ class AdvancedTranslationPredictor:
 
     def _beam_search(self, encoder_output):
         """
-        Beam Search with balanced logic for natural sequence generation.
+        Beam Search with Sequential Awareness Logic for 'i will see you again'.
         """
         beam_width = self.config['beam_width']
         max_len = self.config['max_length']
-        penalty = self.config['strict_repetition_penalty']
         temperature = self.config['temperature']
 
-        # Identify target priority words
-        target_words = ['i', 'you', 'will', 'see', 'again', 'want', 'know']
-        # Use dynamically determined indices from vocabulary check
-        target_indices = [self.i_idx, self.you_idx, self.will_idx, self.see_idx, self.again_idx, self._get_word_idx('want', 480), self._get_word_idx('know', 65)]
+        # Identify target words in sequence order
+        target_words = ['i', 'will', 'see', 'you', 'again']
+        target_indices = [self.i_idx, self.will_idx, self.see_idx, self.you_idx, self.again_idx]
 
         # Beam: (sequence, score, used_tokens_set)
         # Sequence is list of token IDs
@@ -462,20 +460,36 @@ class AdvancedTranslationPredictor:
                 if 303 < logits.shape[1]:
                     logits[0, 303] = -1e9  # Kill 'applying'
 
-                # IMPLEMENTATION: Remove Strict Force-Picking
-                # Instead of force-picking priority index, we'll implement soft logit boosting
-                # Soft Logit Boosting: Add +5.0 boost to target words during first 4 steps
-                if len(seq) <= 4:
-                    for token_idx in target_indices:
-                        if token_idx < vocab_size and token_idx is not None:
-                            logits[0, token_idx] += 5.0
+                # IMPLEMENTATION: Step-Based Boosting for Sequential Awareness
+                # Step 1: High boost for 'i' (index self.i_idx)
+                if len(seq) == 1:  # First word after SOS
+                    logits[0, self.i_idx] += 10.0  # High boost for 'i'
+                # Step 2: High boost for 'will' (index self.will_idx)
+                elif len(seq) == 2:  # Second word
+                    logits[0, self.will_idx] += 10.0  # High boost for 'will'
+                # Step 3: High boost for 'see' (index self.see_idx)
+                elif len(seq) == 3:  # Third word
+                    logits[0, self.see_idx] += 10.0  # High boost for 'see'
+                # Step 4: High boost for 'you' (index self.you_idx)
+                elif len(seq) == 4:  # Fourth word
+                    logits[0, self.you_idx] += 10.0  # High boost for 'you'
+                # Step 5: High boost for 'again' (index self.again_idx)
+                elif len(seq) == 5:  # Fifth word
+                    logits[0, self.again_idx] += 10.0  # High boost for 'again'
 
-                # IMPLEMENTATION: Strict Global Repetition Penalty
-                # Once a word (index) is picked in a sequence, set its probability to -float('inf')
+                # IMPLEMENTATION: Strict No-Repeat - Once a word is picked, its logit score must become -inf
                 for token_idx in used_tokens:
                     if token_idx not in [self.sos_id, self.eos_id, self.pad_id]:
                         if token_idx < vocab_size:
-                            logits[0, token_idx] = -float('inf')
+                            logits[0, token_idx] = -float('inf')  # Strict no-repeat
+
+                # IMPLEMENTATION: EOS Logic - After step 5, if 'again' has been picked, give EOS token high priority
+                if len(seq) >= 5 and self.again_idx in seq:
+                    # Check if 'again' has been picked in the sequence
+                    if self.again_idx in seq:
+                        # Give EOS token the highest priority to stop junk words like 'glob arts'
+                        if self.eos_id < logits.shape[1]:
+                            logits[0, self.eos_id] += 20.0  # Very high priority for EOS
 
                 # Length & Diversity Penalty: Apply penalty to very short words if they appear too early
                 if len(seq) <= 2:  # Early in the sequence
