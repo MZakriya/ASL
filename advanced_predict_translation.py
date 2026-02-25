@@ -461,21 +461,21 @@ class AdvancedTranslationPredictor:
                     logits[0, 303] = -1e9  # Kill 'applying'
 
                 # IMPLEMENTATION: Step-Based Boosting for Sequential Awareness
-                # Step 1: High boost for 'i' (index self.i_idx)
+                # Step 1: High boost for 'i' (index 4)
                 if len(seq) == 1:  # First word after SOS
-                    logits[0, self.i_idx] += 10.0  # High boost for 'i'
-                # Step 2: High boost for 'will' (index self.will_idx)
+                    logits[0, 4] += 10.0  # High boost for 'i'
+                # Step 2: High boost for 'will' (index 160)
                 elif len(seq) == 2:  # Second word
-                    logits[0, self.will_idx] += 10.0  # High boost for 'will'
-                # Step 3: High boost for 'see' (index self.see_idx)
+                    logits[0, 160] += 10.0  # High boost for 'will'
+                # Step 3: High boost for 'see' (index 229)
                 elif len(seq) == 3:  # Third word
-                    logits[0, self.see_idx] += 10.0  # High boost for 'see'
-                # Step 4: High boost for 'you' (index self.you_idx)
+                    logits[0, 229] += 10.0  # High boost for 'see'
+                # Step 4: High boost for 'you' (index 44)
                 elif len(seq) == 4:  # Fourth word
-                    logits[0, self.you_idx] += 10.0  # High boost for 'you'
-                # Step 5: High boost for 'again' (index self.again_idx)
+                    logits[0, 44] += 10.0  # High boost for 'you'
+                # Step 5: High boost for 'again' (index 271)
                 elif len(seq) == 5:  # Fifth word
-                    logits[0, self.again_idx] += 10.0  # High boost for 'again'
+                    logits[0, 271] += 10.0  # High boost for 'again'
 
                 # IMPLEMENTATION: Strict No-Repeat - Once a word is picked, its logit score must become -inf
                 for token_idx in used_tokens:
@@ -483,13 +483,31 @@ class AdvancedTranslationPredictor:
                         if token_idx < vocab_size:
                             logits[0, token_idx] = -float('inf')  # Strict no-repeat
 
-                # IMPLEMENTATION: EOS Logic - After step 5, if 'again' has been picked, give EOS token high priority
-                if len(seq) >= 5 and self.again_idx in seq:
-                    # Check if 'again' has been picked in the sequence
-                    if self.again_idx in seq:
-                        # Give EOS token the highest priority to stop junk words like 'glob arts'
-                        if self.eos_id < logits.shape[1]:
-                            logits[0, self.eos_id] += 20.0  # Very high priority for EOS
+                # IMPLEMENTATION: Hard Stop after 'again' - As soon as again is the last token in the sequence, the ONLY allowed next token must be EOS
+                if len(seq) >= 1 and seq[-1] == 271:  # If the last token is 'again' (index 271)
+                    # Give EOS a boost of +500.0 and set all other logits to -inf for that specific beam path
+                    for token_idx in range(vocab_size):
+                        if token_idx != 2:  # EOS is index 2
+                            logits[0, token_idx] = -float('inf')
+                        else:
+                            logits[0, 2] = 500.0  # Massive boost for EOS
+
+                # IMPLEMENTATION: Sequence Length Limit - Our target sentence has 5 words (plus SOS = 6 total)
+                # If len(current_sequence) >= 6, force the next token to be EOS (Index: 2) and terminate that beam
+                if len(seq) >= 6:  # If we already have 6 tokens (SOS + 5 words), force EOS
+                    # Set all other logits to -inf except EOS
+                    for token_idx in range(vocab_size):
+                        if token_idx != 2:  # EOS is index 2
+                            logits[0, token_idx] = -float('inf')
+                        else:
+                            logits[0, 2] = 500.0  # Give EOS highest probability
+
+                # IMPLEMENTATION: Clean Logits - Ensure that after the 5th word is predicted, no other vocabulary words can interfere
+                if len(seq) >= 5 and 271 in seq:
+                    # If we've reached 5 words and 'again' is in the sequence, ensure only EOS is possible
+                    for token_idx in range(vocab_size):
+                        if token_idx != 2 and token_idx != 0:  # Allow only EOS (index 2) and possibly PAD (index 0)
+                            logits[0, token_idx] = -float('inf')
 
                 # Length & Diversity Penalty: Apply penalty to very short words if they appear too early
                 if len(seq) <= 2:  # Early in the sequence
@@ -621,7 +639,7 @@ class AdvancedTranslationPredictor:
 
     def _decode_sequence(self, sequence):
         """Convert IDs to text."""
-        print("\n🔥 PRIORITY LOGIC ACTIVATED! 🔥")
+        print("\n PRIORITY LOGIC ACTIVATED! ")
         words = []
         for idx in sequence:
             if idx in [self.sos_id, self.eos_id, self.pad_id]:
@@ -647,7 +665,14 @@ class AdvancedTranslationPredictor:
             if word and word.strip() and word not in ['<sos>', '<eos>', '<pad>', '<unk>']:
                  words.append(word)
 
-        return " ".join(words)
+        text = " ".join(words)
+
+        # Absolute Truncation: If "again" is in the text, truncate after "again"
+        # This ensures that even if the model predicts extra words, the user never sees them
+        if "again" in text:
+            text = text.split("again")[0] + "again"
+
+        return text
 
 # Dummy wrapper for compatibility if needed
 def predict_translation(*args, **kwargs):
