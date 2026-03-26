@@ -1,11 +1,24 @@
+# Core Deep Learning
 torch>=2.0.0
 torchvision>=0.15.0
+
+# Web Framework
 fastapi>=0.104.0
 uvicorn[standard]>=0.24.0
 python-multipart>=0.0.6
+
+# Computer Vision & Media Processing
 opencv-python>=4.8.0
 mediapipe>=0.10.0
-numpy>=1.24.0
-textblob>=0.17.1
 Pillow>=10.0.0
+
+# Scientific Computing
+numpy>=1.24.0
+scipy>=1.11.0
+
+# Utilities
 requests>=2.31.0
+typing-extensions>=4.8.0
+
+# Optional: For enhanced text processing
+# textblob>=0.17.1

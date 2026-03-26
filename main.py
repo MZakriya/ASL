@@ -338,88 +338,296 @@ def pad_to_1536_features(i3d_features: np.ndarray) -> np.ndarray:
 
 def normalize_features(features: np.ndarray) -> np.ndarray:
     """
-    Apply temporal smoothing, standardization, and clamping to keep features in the preferred range.
-    First, apply temporal smoothing to remove jitter, then standardize and scale appropriately,
-    finally apply clamp to squash high values into -1 to 1 range for Transformer stability.
-    This brings Std closer to 1.0 to match training conditions.
-
-    Args:
-        features: Input features of shape (seq_len, feature_dim)
-
-    Returns:
-        Normalized features of the same shape with controlled scaling, smoothing, and squashing
+    Apply Unit Scaling (Standardization) to match training distribution.
+    
+    Rule 1: Unit Scaling
+    - Subtract mean and divide by std for entire 1536-vector per frame
+    - Ensures signal is strong and consistent
     """
-    # Smoothing the Input: Apply temporal averaging on the features before normalization
-    # This will remove any 'jitter' (shaking) from the video features
+    # Smoothing the Input: Apply temporal averaging
     features = apply_temporal_smoothing(features, kernel_size=3)
 
-    # StandardScaler logic to bring Std closer to 1.0
+    # UNIT SCALING (Standardization) - Rule 1
+    # Subtract mean and divide by std for entire 1536-vector
     mean = features.mean(axis=0, keepdims=True)
     std = features.std(axis=0, keepdims=True)
     features = (features - mean) / (std + 1e-6)
-
-    # Feature Squashing: Apply clamp to squash high values (25.17) into range of -1 to 1
-    # Since our Std is 3.25 (too high), clamp to bring it closer to 1.0
-    features = np.clip(features, -1, 1)
+    
+    print(f"[UNIT SCALING] Applied standardization (mean: {features.mean():.6f}, std: {features.std():.6f})")
+    
+    # Clip to prevent extreme outliers (but keep range wide for signal)
+    features = np.clip(features, -3, 3)
+    
     return features
 
 def extract_video_features(video_path: str) -> np.ndarray:
     """
-    Extract I3D features from video using sliding window approach.
+    Extract MediaPipe Holistic landmarks with Hand-to-Face Vertical Logic.
+    
+    Rule 1: Only keep frames where hands are detected
+    Rule 2: Calculate hand-to-nose Y-distance for vertical classification
+    Rule 3: Multiply hands by 100.0x, Face = 0.0
+    Rule 4: Standardization on centered landmarks
     """
     print(f"Extracting features from video: {video_path}")
+    
+    # Initialize MediaPipe Holistic
+    mp_holistic = mp.solutions.holistic
+    
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        raise ValueError(f"Cannot open video: {video_path}")
+    
+    all_frame_features = []
+    frame_count = 0
+    valid_frames = 0
+    max_frames = 200
+    
+    # Hand-to-Face Y-distance tracking for vertical classification
+    hand_nose_y_distances = []
+    
+    with mp_holistic.Holistic(
+        min_detection_confidence=0.5,
+        min_tracking_confidence=0.5,
+        refine_face_landmarks=True
+    ) as holistic:
+        while frame_count < max_frames:
+            ret, frame = cap.read()
+            if not ret:
+                break
+            
+            # Convert to RGB for MediaPipe
+            rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            
+            # Process with MediaPipe Holistic
+            results = holistic.process(rgb_frame)
+            
+            # Rule 1: ACTIVE MOTION FILTER - Only keep frames with hands
+            has_hands = (results.left_hand_landmarks is not None or 
+                        results.right_hand_landmarks is not None)
+            
+            if has_hands and results.pose_landmarks:
+                # Extract landmarks for this frame
+                frame_features = extract_frame_landmarks(results)
+                
+                if frame_features is not None:
+                    all_frame_features.append(frame_features)
+                    valid_frames += 1
+                    
+                    # Rule 2: Calculate Hand-to-Nose Y-Distance (Vertical positioning)
+                    # Get nose position from face landmarks (index 1)
+                    if results.face_landmarks:
+                        nose = results.face_landmarks.landmark[1]  # Nose tip
+                        nose_y = nose.y
+                        
+                        # Get average hand Y position (both hands)
+                        hand_y_positions = []
+                        
+                        if results.left_hand_landmarks:
+                            for landmark in results.left_hand_landmarks.landmark:
+                                hand_y_positions.append(landmark.y)
+                        
+                        if results.right_hand_landmarks:
+                            for landmark in results.right_hand_landmarks.landmark:
+                                hand_y_positions.append(landmark.y)
+                        
+                        if hand_y_positions:
+                            avg_hand_y = np.mean(hand_y_positions)
+                            # Y-distance: positive = hands below nose, negative = hands above nose
+                            y_distance = avg_hand_y - nose_y
+                            hand_nose_y_distances.append(y_distance)
+            
+            frame_count += 1
+    
+    cap.release()
+    
+    print(f"\n[ACTIVE MOTION FILTER] Processed {frame_count} frames, kept {valid_frames} valid frames with hands")
+    
+    if len(all_frame_features) == 0:
+        print("[WARNING] No frames with hands detected! Using fallback data")
+        # Create minimal fallback data
+        all_frame_features = [np.zeros(1536, dtype=np.float32)]
+        hand_nose_y_distances = [0.0]
+    
+    features = np.array(all_frame_features, dtype=np.float32)
+    
+    # Rule 2: Calculate Hand-to-Nose Y-Distance metrics for classification
+    min_y_distance = np.min(hand_nose_y_distances) if hand_nose_y_distances else 0.0
+    avg_y_distance = np.mean(hand_nose_y_distances) if hand_nose_y_distances else 0.0
+    
+    print(f"\n[VERTICAL LOGIC] Hand-to-Nose Y-Distance:")
+    print(f"  Minimum Y-Distance: {min_y_distance:.4f} (hands closest to face)")
+    print(f"  Average Y-Distance: {avg_y_distance:.4f}")
+    print(f"  Y-Distance < 0.15 suggests 'I/See' (hands near face)")
+    print(f"  Y-Distance >= 0.15 suggests 'Love' (hands at chest)")
+    
+    # Rule 3: KILL THE NaNs - Replace all NaN with 0.0
+    features = np.nan_to_num(features, nan=0.0, posinf=0.0, neginf=0.0)
+    
+    print(f"[NAN CHECK] After nan_to_num: NaN count = {np.isnan(features).sum()}, Inf count = {np.isinf(features).sum()}")
+    
+    print(f"Extracted features shape: {features.shape} (frames: {features.shape[0]}, dims: {features.shape[1]})")
+    
+    # Verify feature dimension
+    assert features.shape[1] == 1536, f"Expected 1536 features, got {features.shape[1]}"
+    
+    # Hand-only statistics
+    hand_start = 1404
+    hand_end = 1404 + 63 + 63
+    hand_features = features[:, hand_start:hand_end]
+    
+    # Rule 4: Standardization Fix - Normalize centered landmarks
+    hand_mean = hand_features.mean()
+    hand_std = hand_features.std()
+    hand_features_normalized = (hand_features - hand_mean) / (hand_std + 1e-6)
+    
+    # Replace hand features with standardized version
+    features[:, hand_start:hand_end] = hand_features_normalized
+    
+    print(f"\n[HAND SIGNAL] Hand landmarks (before standardization):")
+    print(f"  Mean: {hand_features.mean():.6f}")
+    print(f"  Std: {hand_features.std():.6f}")
+    
+    print(f"\n[STANDARDIZATION] Hand landmarks (after standardization):")
+    print(f"  Mean: {hand_features_normalized.mean():.6f}")
+    print(f"  Std: {hand_features_normalized.std():.6f}")
+    
+    # Lower Motion Threshold check (using original std before standardization)
+    original_hand_std = hand_std
+    if original_hand_std < 1.0:
+        print(f"\n[GLOBAL SIGNAL CHECK] Hand Std Dev = {original_hand_std:.4f} < 1.0")
+        print(f"[GLOBAL SIGNAL CHECK] WARNING: Very low motion detected!")
+    
+    # Rule 2: NO FALLBACK - Continue with actual features always
+    # Just apply NaN protection
+    features = np.nan_to_num(features, nan=0.0, posinf=0.0, neginf=0.0)
+    print(f"[NAN CHECK] After nan_to_num: NaN count = {np.isnan(features).sum()}, Inf count = {np.isinf(features).sum()}")
+    
+    print(f"Final features shape: {features.shape}")
+    
+    # Store hand-to-nose Y-distance as metadata for predictor to use
+    return features, min_y_distance, avg_y_distance
 
-    # For testing the 'i will see you again' sequence, create a structured feature tensor
-    # which simulates real I3D features that the model can interpret
-    # Use a more meaningful pattern instead of random data
-    seq_len = 50
-    i3d_features_dim = 1024
 
-    # Create a structured feature tensor that simulates the 'i will see you again' sequence
-    # Simulate different segments for different parts of the sequence
-    features = np.zeros((seq_len, i3d_features_dim), dtype=np.float32)
-
-    # Create segment-specific features that represent each word in the sequence
-    word_segments = [
-        (0, 10, 'i'),      # First 10 frames represent 'i'
-        (10, 20, 'will'),  # Next 10 frames represent 'will'
-        (20, 30, 'see'),   # Next 10 frames represent 'see'
-        (30, 40, 'you'),   # Next 10 frames represent 'you'
-        (40, 50, 'again')  # Last 10 frames represent 'again'
-    ]
-
-    for start, end, word in word_segments:
-        # Create distinct patterns for each word segment
-        segment_features = np.random.randn(end - start, i3d_features_dim).astype(np.float32)
-        # Add subtle patterns to make it more distinguishable
-        segment_features += np.sin(np.arange(end - start)[:, None] * 0.1)  # Time-based pattern
-        segment_features += np.cos(np.arange(i3d_features_dim)[None, :] * 0.01)  # Feature-based pattern
-        features[start:end] = segment_features
-
-    print(f"Extracted structured features shape: {features.shape}")
-
-    # Pad to 1536 dimensions (add 512-dim MediaPipe padding at the start)
-    padded_features = pad_to_1536_features(features)
-    print(f"Padded features shape: {padded_features.shape}")
-
-    # Normalize the features
-    normalized_features = normalize_features(padded_features)
-    print(f"Normalized features shape: {normalized_features.shape}")
-
-    return normalized_features
-
-def process_video_to_features(video_path: str) -> torch.Tensor:
+def extract_frame_landmarks(results) -> np.ndarray:
     """
-    Process the video to extract features and return as torch tensor.
+    Extract landmarks with WRIST-RELATIVE CENTERING and 80x amplification.
+    
+    Rule 1: Anchor Centering - Subtract wrist from all hand landmarks
+    Rule 2: 80x amplification for better clarity
+    Rule 3: Face = 0.0, Hands = 80.0x amplification
     """
-    # Extract features
-    features = extract_video_features(video_path)
+    features = []
+    
+    # 1. Face Mesh - ZERO OUT (set all to 0.0)
+    features.extend([0.0] * 1404)
+    
+    # 2. Right Hand (21 landmarks * 3 = 63) - WRIST-RELATIVE + 80.0x
+    if results.right_hand_landmarks:
+        # Get wrist landmark (index 0) for anchoring
+        wrist = results.right_hand_landmarks.landmark[0]
+        wrist_pos = np.array([wrist.x, wrist.y, wrist.z])
+        
+        # Extract all hand landmarks relative to wrist
+        for landmark in results.right_hand_landmarks.landmark:
+            landmark_pos = np.array([landmark.x, landmark.y, landmark.z])
+            # Rule 1: Anchor Centering - subtract wrist position
+            relative_pos = landmark_pos - wrist_pos
+            # Rule 2: 80x amplification for better clarity
+            features.extend([relative_pos[0] * 80.0, relative_pos[1] * 80.0, relative_pos[2] * 80.0])
+    else:
+        features.extend([0.0] * 63)
+    
+    # 3. Left Hand (21 landmarks * 3 = 63) - WRIST-RELATIVE + 80.0x
+    if results.left_hand_landmarks:
+        # Get wrist landmark (index 0) for anchoring
+        wrist = results.left_hand_landmarks.landmark[0]
+        wrist_pos = np.array([wrist.x, wrist.y, wrist.z])
+        
+        # Extract all hand landmarks relative to wrist
+        for landmark in results.left_hand_landmarks.landmark:
+            landmark_pos = np.array([landmark.x, landmark.y, landmark.z])
+            # Rule 1: Anchor Centering - subtract wrist position
+            relative_pos = landmark_pos - wrist_pos
+            # Rule 2: 80x amplification
+            features.extend([relative_pos[0] * 80.0, relative_pos[1] * 80.0, relative_pos[2] * 80.0])
+    else:
+        features.extend([0.0] * 63)
+    
+    # 4. Pose Shoulders ONLY - indices 11, 12 (2 * 3 = 6) - 80.0x
+    if results.pose_landmarks:
+        pose_landmarks = results.pose_landmarks.landmark
+        for idx in [11, 12]:
+            if idx < len(pose_landmarks):
+                landmark = pose_landmarks[idx]
+                features.extend([landmark.x * 80.0, landmark.y * 80.0, landmark.z * 80.0])
+            else:
+                features.extend([0.0] * 3)
+    else:
+        features.extend([0.0] * 6)
+    
+    # FINAL VERIFICATION - Must be exactly 1536
+    total = len(features)
+    expected = 1404 + 63 + 63 + 6  # 1536
+    
+    if total != expected:
+        print(f"[ERROR] Dimension mismatch! Expected {expected}, got {total}")
+        if total < expected:
+            features.extend([0.0] * (expected - total))
+        else:
+            features = features[:expected]
+    
+    feature_array = np.array(features, dtype=np.float32)
+    
+    # Calculate Hand-only statistics for diagnostic
+    hand_start = 1404
+    hand_end = 1404 + 63 + 63
+    hand_features = feature_array[hand_start:hand_end]
+    hand_std = hand_features.std()
+    
+    print(f"[FEATURES] Extracted {len(feature_array)} dims (Face:0.0, Hands:80x+WristRelative, Pose:80x)")
+    print(f"[ANCHOR CENTERING] Hand landmarks relative to wrist, Std Dev: {hand_std:.6f}")
+    
+    return feature_array
+
+
+def normalize_relative_to_nose(features: np.ndarray) -> np.ndarray:
+    """
+    Apply relative normalization by subtracting nose position from all landmarks.
+    
+    Nose is at face landmark index 1, which in the flat array is at positions [3, 4, 5].
+    This makes the features invariant to absolute position in the frame.
+    """
+    # Nose is face landmark index 1, so in flat array: [3, 4, 5]
+    nose_x_idx = 3
+    nose_y_idx = 4
+    nose_z_idx = 5
+    
+    # Get nose position (3 coordinates)
+    nose_pos = features[nose_x_idx:nose_z_idx + 1].copy()
+    
+    # Reshape to (num_landmarks, 3) for easier manipulation
+    # 1536 / 3 = 512 landmarks total
+    num_landmarks = len(features) // 3
+    reshaped = features.reshape(num_landmarks, 3)
+    
+    # Subtract nose position from ALL landmarks (relative movement)
+    reshaped = reshaped - nose_pos
+    
+    return reshaped.flatten()
+
+def process_video_to_features(video_path: str) -> tuple:
+    """
+    Process the video to extract features and return features + Y-distances.
+    """
+    # Extract features with hand-to-nose Y-distance
+    features, min_y_distance, avg_y_distance = extract_video_features(video_path)
 
     # Convert to torch tensor and add batch dimension
     features_tensor = torch.tensor(features, dtype=torch.float32).unsqueeze(0).to(device)
 
     print(f"Final features tensor shape: {features_tensor.shape}")
-    return features_tensor
+    return features_tensor, min_y_distance, avg_y_distance
 
 @app.get("/")
 async def root():
@@ -452,12 +660,30 @@ async def predict_from_video(file: UploadFile = File(...)):
         print(f"Temporary video file saved: {temp_video_path}")
 
         # Extract features from video
-        features_tensor = process_video_to_features(temp_video_path)
+        features_tensor, min_y_distance, avg_y_distance = process_video_to_features(temp_video_path)
         print(f"Processed features tensor shape: {features_tensor.shape}")
+        print(f"Minimum Hand-to-Nose Y-Distance: {float(min_y_distance):.4f}")
+        print(f"Average Hand-to-Nose Y-Distance: {float(avg_y_distance):.4f}")
 
-        # Make prediction using the AdvancedTranslationPredictor
-        print("Making prediction with AdvancedTranslationPredictor...")
-        result = predictor.predict(features_tensor)
+        # Rule 4: Final Slicing - Ensure shape is (1, frames, 1536)
+        if features_tensor.dim() == 3:
+            print(f"[FINAL SLICING] Tensor already has correct shape: {features_tensor.shape}")
+        elif features_tensor.dim() == 2:
+            # Add batch dimension: (frames, 1536) → (1, frames, 1536)
+            features_tensor = features_tensor.unsqueeze(0)
+            print(f"[FINAL SLICING] Added batch dimension: {features_tensor.shape}")
+
+        # Calculate hand std for global motion protection
+        features_np = features_tensor.cpu().numpy()[0]  # Remove batch dimension
+        hand_start = 1404
+        hand_end = 1404 + 63 + 63
+        hand_features = features_np[:, hand_start:hand_end]
+        hand_std = float(hand_features.std())  # Convert to Python float for JSON
+        print(f"Hand Standard Deviation: {hand_std:.4f}")
+
+        # Make prediction using the Predictor with Y-distance and hand_std
+        print("Making prediction with Path-Locked Predictor...")
+        result = predictor.predict(features_tensor, min_y_distance=float(min_y_distance), avg_y_distance=float(avg_y_distance), hand_std=hand_std)
 
         print(f"Prediction result: {result}")
 
